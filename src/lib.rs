@@ -54,17 +54,12 @@ pub struct PluginHelp {
 // Host-to-Plugin Communication
 // ============================================================================
 
-/// The host preserves an explicitly selected plugin namespace as a safe
-/// pass-through boundary.
+/// The host honors the execution policy included with a plugin's plan response.
 ///
-/// A host advertising this capability applies namespace-specific argument
-/// ownership instead of generic flag extraction, leaves payload after `--`
-/// opaque, and executes the namespace's returned command plan without Loop
-/// command-alias expansion. Plugins that broaden a namespace beyond a fixed
-/// command catalog can require this capability and fail closed with older
-/// hosts. The version suffix allows the contract to evolve without changing
-/// the protocol shape.
-pub const HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH: &str = "safe-namespace-passthrough-v1";
+/// Plugins can require this capability before returning a plan whose execution
+/// policy differs from the legacy host behavior. The version suffix allows the
+/// policy contract to evolve without changing the protocol shape.
+pub const HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1: &str = "plan-execution-policy-v1";
 
 /// A request from the meta CLI host to a plugin, sent as JSON on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,10 +166,49 @@ pub struct PlannedCommand {
     pub env: Option<HashMap<String, String>>,
 }
 
+/// Controls which host transformations are applied to an execution plan.
+///
+/// The default preserves the behavior used before execution policies were
+/// added to the protocol, so responses from older plugins remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanExecutionPolicy {
+    /// Whether the host expands its command aliases before execution.
+    pub expand_loop_aliases: bool,
+    /// Whether the host applies its configured project filters to the plan.
+    pub apply_host_filters: bool,
+}
+
+impl PlanExecutionPolicy {
+    /// The execution behavior used for plan responses that predate this policy.
+    pub const fn legacy_defaults() -> Self {
+        Self {
+            expand_loop_aliases: true,
+            apply_host_filters: true,
+        }
+    }
+
+    fn is_legacy_default(&self) -> bool {
+        *self == Self::legacy_defaults()
+    }
+}
+
+impl Default for PlanExecutionPolicy {
+    fn default() -> Self {
+        Self::legacy_defaults()
+    }
+}
+
 /// Wrapper for the execution plan response (the JSON envelope plugins emit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResponse {
     pub plan: ExecutionPlan,
+    /// Host transformations to apply while executing this plan.
+    #[serde(
+        default,
+        skip_serializing_if = "PlanExecutionPolicy::is_legacy_default"
+    )]
+    pub execution_policy: PlanExecutionPolicy,
 }
 
 // ============================================================================
@@ -185,8 +219,12 @@ pub struct PlanResponse {
 pub enum CommandResult {
     /// A plan of commands to execute via loop_lib (simple form, no pre/post commands)
     Plan(Vec<PlannedCommand>, Option<bool>),
+    /// A simple plan with an explicit host execution policy
+    PlanWithPolicy(Vec<PlannedCommand>, Option<bool>, PlanExecutionPolicy),
     /// A full execution plan with pre/post commands
     FullPlan(ExecutionPlan),
+    /// A full execution plan with an explicit host execution policy
+    FullPlanWithPolicy(ExecutionPlan, PlanExecutionPolicy),
     /// A message to display (no commands to execute)
     Message(String),
     /// An error occurred
@@ -201,7 +239,24 @@ pub enum CommandResult {
 
 /// Serialize and print an execution plan to stdout.
 pub fn output_execution_plan(commands: Vec<PlannedCommand>, parallel: Option<bool>) {
-    output_execution_plan_full(vec![], commands, vec![], parallel, None, None);
+    output_execution_plan_with_policy(commands, parallel, PlanExecutionPolicy::default());
+}
+
+/// Serialize and print an execution plan with an explicit host execution policy.
+pub fn output_execution_plan_with_policy(
+    commands: Vec<PlannedCommand>,
+    parallel: Option<bool>,
+    execution_policy: PlanExecutionPolicy,
+) {
+    output_execution_plan_full_with_policy(
+        vec![],
+        commands,
+        vec![],
+        parallel,
+        None,
+        None,
+        execution_policy,
+    );
 }
 
 /// Serialize and print a full execution plan with pre/post commands to stdout.
@@ -213,6 +268,27 @@ pub fn output_execution_plan_full(
     max_parallel: Option<usize>,
     spawn_stagger_ms: Option<u64>,
 ) {
+    output_execution_plan_full_with_policy(
+        pre_commands,
+        commands,
+        post_commands,
+        parallel,
+        max_parallel,
+        spawn_stagger_ms,
+        PlanExecutionPolicy::default(),
+    );
+}
+
+/// Serialize and print a full execution plan with an explicit host execution policy.
+pub fn output_execution_plan_full_with_policy(
+    pre_commands: Vec<PlannedCommand>,
+    commands: Vec<PlannedCommand>,
+    post_commands: Vec<PlannedCommand>,
+    parallel: Option<bool>,
+    max_parallel: Option<usize>,
+    spawn_stagger_ms: Option<u64>,
+    execution_policy: PlanExecutionPolicy,
+) {
     let response = PlanResponse {
         plan: ExecutionPlan {
             pre_commands,
@@ -222,6 +298,7 @@ pub fn output_execution_plan_full(
             max_parallel,
             spawn_stagger_ms,
         },
+        execution_policy,
     };
     println!("{}", serde_json::to_string(&response).unwrap());
 }
@@ -334,8 +411,21 @@ pub fn run_plugin(plugin: PluginDefinition) {
                 CommandResult::Plan(commands, parallel) => {
                     output_execution_plan(commands, parallel);
                 }
+                CommandResult::PlanWithPolicy(commands, parallel, execution_policy) => {
+                    output_execution_plan_with_policy(commands, parallel, execution_policy);
+                }
                 CommandResult::FullPlan(plan) => {
-                    let response = PlanResponse { plan };
+                    let response = PlanResponse {
+                        plan,
+                        execution_policy: PlanExecutionPolicy::default(),
+                    };
+                    println!("{}", serde_json::to_string(&response).unwrap());
+                }
+                CommandResult::FullPlanWithPolicy(plan, execution_policy) => {
+                    let response = PlanResponse {
+                        plan,
+                        execution_policy,
+                    };
                     println!("{}", serde_json::to_string(&response).unwrap());
                 }
                 CommandResult::Message(msg) => {
@@ -380,8 +470,8 @@ mod tests {
     fn legacy_requests_default_to_no_host_capabilities() {
         let request: PluginRequest = serde_json::from_str(
             r#"{
-                "command": "cargo check",
-                "args": ["cargo", "check"],
+                "command": "demo build",
+                "args": ["demo", "build"],
                 "projects": [],
                 "cwd": ".",
                 "options": {}
@@ -390,18 +480,18 @@ mod tests {
         .unwrap();
 
         assert!(request.host_capabilities.is_empty());
-        assert!(!request.host_supports_capability(HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH));
+        assert!(!request.host_supports_capability(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1));
     }
 
     #[test]
     fn host_capabilities_round_trip_and_remain_extensible() {
         let request = PluginRequest {
-            command: "cargo".to_string(),
-            args: vec!["check".to_string()],
+            command: "demo".to_string(),
+            args: vec!["build".to_string()],
             projects: vec![],
             cwd: ".".to_string(),
             host_capabilities: vec![
-                HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH.to_string(),
+                HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1.to_string(),
                 "future-host-capability-v9".to_string(),
             ],
             options: PluginRequestOptions::default(),
@@ -410,7 +500,71 @@ mod tests {
         let json = serde_json::to_string(&request).unwrap();
         let decoded: PluginRequest = serde_json::from_str(&json).unwrap();
 
-        assert!(decoded.host_supports_capability(HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH));
+        assert!(decoded.host_supports_capability(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1));
         assert!(decoded.host_supports_capability("future-host-capability-v9"));
+    }
+
+    #[test]
+    fn legacy_plan_response_defaults_to_legacy_execution_policy() {
+        let legacy_json = r#"{
+            "plan": {
+                "commands": [{"dir": ".", "cmd": "demo build"}],
+                "parallel": false
+            }
+        }"#;
+        let legacy_value: serde_json::Value = serde_json::from_str(legacy_json).unwrap();
+
+        let response: PlanResponse = serde_json::from_str(legacy_json).unwrap();
+
+        assert_eq!(
+            response.execution_policy,
+            PlanExecutionPolicy::legacy_defaults()
+        );
+        assert_eq!(response.plan.commands[0].cmd, "demo build");
+
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(encoded, legacy_value);
+    }
+
+    #[test]
+    fn explicit_plan_execution_policy_round_trips() {
+        let response = PlanResponse {
+            plan: ExecutionPlan {
+                pre_commands: vec![],
+                commands: vec![PlannedCommand {
+                    dir: ".".to_string(),
+                    cmd: "demo build".to_string(),
+                    env: None,
+                }],
+                post_commands: vec![],
+                parallel: Some(false),
+                max_parallel: None,
+                spawn_stagger_ms: None,
+            },
+            execution_policy: PlanExecutionPolicy {
+                expand_loop_aliases: false,
+                apply_host_filters: false,
+            },
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.execution_policy, response.execution_policy);
+        assert!(json.contains("execution_policy"));
+    }
+
+    #[test]
+    fn partial_execution_policy_uses_legacy_field_defaults() {
+        let response: PlanResponse = serde_json::from_str(
+            r#"{
+                "plan": {"commands": []},
+                "execution_policy": {"expand_loop_aliases": false}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!response.execution_policy.expand_loop_aliases);
+        assert!(response.execution_policy.apply_host_filters);
     }
 }
