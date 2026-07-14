@@ -54,6 +54,18 @@ pub struct PluginHelp {
 // Host-to-Plugin Communication
 // ============================================================================
 
+/// The host preserves an explicitly selected plugin namespace as a safe
+/// pass-through boundary.
+///
+/// A host advertising this capability applies namespace-specific argument
+/// ownership instead of generic flag extraction, leaves payload after `--`
+/// opaque, and executes the namespace's returned command plan without Loop
+/// command-alias expansion. Plugins that broaden a namespace beyond a fixed
+/// command catalog can require this capability and fail closed with older
+/// hosts. The version suffix allows the contract to evolve without changing
+/// the protocol shape.
+pub const HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH: &str = "safe-namespace-passthrough-v1";
+
 /// A request from the meta CLI host to a plugin, sent as JSON on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginRequest {
@@ -64,8 +76,23 @@ pub struct PluginRequest {
     pub projects: Vec<String>,
     #[serde(default)]
     pub cwd: String,
+    /// Host behavior guarantees available to this request.
+    ///
+    /// This is a string list so newer hosts can add capabilities without
+    /// making older plugins reject otherwise-compatible request JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_capabilities: Vec<String>,
     #[serde(default)]
     pub options: PluginRequestOptions,
+}
+
+impl PluginRequest {
+    /// Whether the host advertised a specific behavior guarantee.
+    pub fn host_supports_capability(&self, capability: &str) -> bool {
+        self.host_capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
+    }
 }
 
 /// Options passed from the host to the plugin as part of the request.
@@ -342,5 +369,48 @@ pub fn run_plugin(plugin: PluginDefinition) {
             eprintln!("Use via: meta {}", plugin.info.name);
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_requests_default_to_no_host_capabilities() {
+        let request: PluginRequest = serde_json::from_str(
+            r#"{
+                "command": "cargo check",
+                "args": ["cargo", "check"],
+                "projects": [],
+                "cwd": ".",
+                "options": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(request.host_capabilities.is_empty());
+        assert!(!request.host_supports_capability(HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH));
+    }
+
+    #[test]
+    fn host_capabilities_round_trip_and_remain_extensible() {
+        let request = PluginRequest {
+            command: "cargo".to_string(),
+            args: vec!["check".to_string()],
+            projects: vec![],
+            cwd: ".".to_string(),
+            host_capabilities: vec![
+                HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH.to_string(),
+                "future-host-capability-v9".to_string(),
+            ],
+            options: PluginRequestOptions::default(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let decoded: PluginRequest = serde_json::from_str(&json).unwrap();
+
+        assert!(decoded.host_supports_capability(HOST_CAPABILITY_SAFE_NAMESPACE_PASSTHROUGH));
+        assert!(decoded.host_supports_capability("future-host-capability-v9"));
     }
 }
