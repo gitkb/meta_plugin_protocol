@@ -508,8 +508,17 @@ pub fn run_plugin(plugin: PluginDefinition) {
 /// Definition of a plugin that negotiates host capabilities.
 pub struct PluginDefinitionWithCapabilities {
     pub info: PluginInfo,
+    /// Command roots whose bare invocation is side-effect-free help.
+    pub bare_help_commands: Vec<String>,
     /// The execute function receives the capability-aware request.
     pub execute: fn(PluginRequestWithCapabilities) -> CommandResultWithPolicy,
+}
+
+#[derive(Serialize)]
+struct CapabilityPluginInfo<'a> {
+    #[serde(flatten)]
+    info: &'a PluginInfo,
+    bare_help_commands: &'a [String],
 }
 
 /// Run a capability-aware plugin while retaining the legacy plugin harness API.
@@ -528,7 +537,11 @@ pub fn run_plugin_with_capabilities(plugin: PluginDefinitionWithCapabilities) {
 
     match args[1].as_str() {
         "--meta-plugin-info" => {
-            let json = serde_json::to_string_pretty(&plugin.info).unwrap();
+            let json = serde_json::to_string_pretty(&CapabilityPluginInfo {
+                info: &plugin.info,
+                bare_help_commands: &plugin.bare_help_commands,
+            })
+            .unwrap();
             println!("{json}");
         }
         "--meta-plugin-exec" => {
