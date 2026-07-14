@@ -71,6 +71,23 @@ pub struct PluginRequest {
     pub projects: Vec<String>,
     #[serde(default)]
     pub cwd: String,
+    #[serde(default)]
+    pub options: PluginRequestOptions,
+}
+
+/// A capability-aware request from a newer host to a plugin.
+///
+/// This is a separate type so adding capability negotiation does not break
+/// source compatibility for plugins that construct [`PluginRequest`] values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginRequestWithCapabilities {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub cwd: String,
     /// Host behavior guarantees available to this request.
     ///
     /// This is a string list so newer hosts can add capabilities without
@@ -81,7 +98,7 @@ pub struct PluginRequest {
     pub options: PluginRequestOptions,
 }
 
-impl PluginRequest {
+impl PluginRequestWithCapabilities {
     /// Whether the host advertised a specific behavior guarantee.
     pub fn host_supports_capability(&self, capability: &str) -> bool {
         self.host_capabilities
@@ -203,6 +220,17 @@ impl Default for PlanExecutionPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResponse {
     pub plan: ExecutionPlan,
+}
+
+/// A plan response carrying behavior selected by a capability-aware plugin.
+///
+/// Legacy hosts ignore the additional JSON field, while newer hosts can
+/// deserialize legacy responses because the policy defaults to legacy behavior.
+/// Keeping this separate preserves source compatibility for `PlanResponse`
+/// struct literals in existing plugins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResponseWithPolicy {
+    pub plan: ExecutionPlan,
     /// Host transformations to apply while executing this plan.
     #[serde(
         default,
@@ -219,17 +247,35 @@ pub struct PlanResponse {
 pub enum CommandResult {
     /// A plan of commands to execute via loop_lib (simple form, no pre/post commands)
     Plan(Vec<PlannedCommand>, Option<bool>),
-    /// A simple plan with an explicit host execution policy
-    PlanWithPolicy(Vec<PlannedCommand>, Option<bool>, PlanExecutionPolicy),
     /// A full execution plan with pre/post commands
     FullPlan(ExecutionPlan),
-    /// A full execution plan with an explicit host execution policy
-    FullPlanWithPolicy(ExecutionPlan, PlanExecutionPolicy),
     /// A message to display (no commands to execute)
     Message(String),
     /// An error occurred
     Error(String),
     /// Show help text (optionally with an error message prefix)
+    ShowHelp(Option<String>),
+}
+
+/// The result of a capability-aware plugin command execution.
+///
+/// This mirrors [`CommandResult`] and adds policy-bearing plan variants without
+/// adding variants to the legacy public enum, which would break exhaustive
+/// matches in existing plugins.
+pub enum CommandResultWithPolicy {
+    /// A simple plan using legacy host execution behavior.
+    Plan(Vec<PlannedCommand>, Option<bool>),
+    /// A simple plan with an explicit host execution policy.
+    PlanWithPolicy(Vec<PlannedCommand>, Option<bool>, PlanExecutionPolicy),
+    /// A full execution plan using legacy host execution behavior.
+    FullPlan(ExecutionPlan),
+    /// A full execution plan with an explicit host execution policy.
+    FullPlanWithPolicy(ExecutionPlan, PlanExecutionPolicy),
+    /// A message to display (no commands to execute).
+    Message(String),
+    /// An error occurred.
+    Error(String),
+    /// Show help text (optionally with an error message prefix).
     ShowHelp(Option<String>),
 }
 
@@ -239,7 +285,7 @@ pub enum CommandResult {
 
 /// Serialize and print an execution plan to stdout.
 pub fn output_execution_plan(commands: Vec<PlannedCommand>, parallel: Option<bool>) {
-    output_execution_plan_with_policy(commands, parallel, PlanExecutionPolicy::default());
+    output_execution_plan_full(vec![], commands, vec![], parallel, None, None);
 }
 
 /// Serialize and print an execution plan with an explicit host execution policy.
@@ -268,15 +314,17 @@ pub fn output_execution_plan_full(
     max_parallel: Option<usize>,
     spawn_stagger_ms: Option<u64>,
 ) {
-    output_execution_plan_full_with_policy(
-        pre_commands,
-        commands,
-        post_commands,
-        parallel,
-        max_parallel,
-        spawn_stagger_ms,
-        PlanExecutionPolicy::default(),
-    );
+    let response = PlanResponse {
+        plan: ExecutionPlan {
+            pre_commands,
+            commands,
+            post_commands,
+            parallel,
+            max_parallel,
+            spawn_stagger_ms,
+        },
+    };
+    println!("{}", serde_json::to_string(&response).unwrap());
 }
 
 /// Serialize and print a full execution plan with an explicit host execution policy.
@@ -289,7 +337,7 @@ pub fn output_execution_plan_full_with_policy(
     spawn_stagger_ms: Option<u64>,
     execution_policy: PlanExecutionPolicy,
 ) {
-    let response = PlanResponse {
+    let response = PlanResponseWithPolicy {
         plan: ExecutionPlan {
             pre_commands,
             commands,
@@ -308,6 +356,14 @@ pub fn read_request_from_stdin() -> anyhow::Result<PluginRequest> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let request: PluginRequest = serde_json::from_str(&input)?;
+    Ok(request)
+}
+
+/// Read and parse a capability-aware plugin request from stdin.
+pub fn read_capability_request_from_stdin() -> anyhow::Result<PluginRequestWithCapabilities> {
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let request: PluginRequestWithCapabilities = serde_json::from_str(&input)?;
     Ok(request)
 }
 
@@ -411,21 +467,8 @@ pub fn run_plugin(plugin: PluginDefinition) {
                 CommandResult::Plan(commands, parallel) => {
                     output_execution_plan(commands, parallel);
                 }
-                CommandResult::PlanWithPolicy(commands, parallel, execution_policy) => {
-                    output_execution_plan_with_policy(commands, parallel, execution_policy);
-                }
                 CommandResult::FullPlan(plan) => {
-                    let response = PlanResponse {
-                        plan,
-                        execution_policy: PlanExecutionPolicy::default(),
-                    };
-                    println!("{}", serde_json::to_string(&response).unwrap());
-                }
-                CommandResult::FullPlanWithPolicy(plan, execution_policy) => {
-                    let response = PlanResponse {
-                        plan,
-                        execution_policy,
-                    };
+                    let response = PlanResponse { plan };
                     println!("{}", serde_json::to_string(&response).unwrap());
                 }
                 CommandResult::Message(msg) => {
@@ -462,12 +505,98 @@ pub fn run_plugin(plugin: PluginDefinition) {
     }
 }
 
+/// Definition of a plugin that negotiates host capabilities.
+pub struct PluginDefinitionWithCapabilities {
+    pub info: PluginInfo,
+    /// The execute function receives the capability-aware request.
+    pub execute: fn(PluginRequestWithCapabilities) -> CommandResultWithPolicy,
+}
+
+/// Run a capability-aware plugin while retaining the legacy plugin harness API.
+pub fn run_plugin_with_capabilities(plugin: PluginDefinitionWithCapabilities) {
+    env_logger::init();
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        eprintln!(
+            "This binary is a meta plugin. Use via: meta {}",
+            plugin.info.name
+        );
+        std::process::exit(1);
+    }
+
+    match args[1].as_str() {
+        "--meta-plugin-info" => {
+            let json = serde_json::to_string_pretty(&plugin.info).unwrap();
+            println!("{json}");
+        }
+        "--meta-plugin-exec" => {
+            let request = match read_capability_request_from_stdin() {
+                Ok(req) => req,
+                Err(e) => {
+                    eprintln!("Failed to parse plugin request: {e}");
+                    std::process::exit(1);
+                }
+            };
+
+            match (plugin.execute)(request) {
+                CommandResultWithPolicy::Plan(commands, parallel) => {
+                    output_execution_plan(commands, parallel);
+                }
+                CommandResultWithPolicy::PlanWithPolicy(commands, parallel, execution_policy) => {
+                    output_execution_plan_with_policy(commands, parallel, execution_policy);
+                }
+                CommandResultWithPolicy::FullPlan(plan) => {
+                    let response = PlanResponse { plan };
+                    println!("{}", serde_json::to_string(&response).unwrap());
+                }
+                CommandResultWithPolicy::FullPlanWithPolicy(plan, execution_policy) => {
+                    let response = PlanResponseWithPolicy {
+                        plan,
+                        execution_policy,
+                    };
+                    println!("{}", serde_json::to_string(&response).unwrap());
+                }
+                CommandResultWithPolicy::Message(msg) => {
+                    if !msg.is_empty() {
+                        println!("{msg}");
+                    }
+                }
+                CommandResultWithPolicy::Error(e) => {
+                    eprintln!("Error: {e}");
+                    std::process::exit(1);
+                }
+                CommandResultWithPolicy::ShowHelp(maybe_error) => {
+                    if let Some(ref err) = maybe_error {
+                        eprintln!("error: {err}");
+                        eprintln!();
+                        eprint_plugin_help(&plugin.info);
+                        std::process::exit(1);
+                    } else {
+                        print_plugin_help(&plugin.info);
+                        std::process::exit(0);
+                    }
+                }
+            }
+        }
+        "--help" | "-h" => {
+            print_plugin_help(&plugin.info);
+        }
+        _ => {
+            eprintln!("Unknown flag: {}. This binary is a meta plugin.", args[1]);
+            eprintln!("Use via: meta {}", plugin.info.name);
+            std::process::exit(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn legacy_requests_default_to_no_host_capabilities() {
+    fn legacy_request_shape_remains_unchanged() {
         let request: PluginRequest = serde_json::from_str(
             r#"{
                 "command": "demo build",
@@ -479,13 +608,13 @@ mod tests {
         )
         .unwrap();
 
-        assert!(request.host_capabilities.is_empty());
-        assert!(!request.host_supports_capability(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1));
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert!(encoded.get("host_capabilities").is_none());
     }
 
     #[test]
     fn host_capabilities_round_trip_and_remain_extensible() {
-        let request = PluginRequest {
+        let request = PluginRequestWithCapabilities {
             command: "demo".to_string(),
             args: vec!["build".to_string()],
             projects: vec![],
@@ -498,14 +627,14 @@ mod tests {
         };
 
         let json = serde_json::to_string(&request).unwrap();
-        let decoded: PluginRequest = serde_json::from_str(&json).unwrap();
+        let decoded: PluginRequestWithCapabilities = serde_json::from_str(&json).unwrap();
 
         assert!(decoded.host_supports_capability(HOST_CAPABILITY_PLAN_EXECUTION_POLICY_V1));
         assert!(decoded.host_supports_capability("future-host-capability-v9"));
     }
 
     #[test]
-    fn legacy_plan_response_defaults_to_legacy_execution_policy() {
+    fn legacy_plan_response_shape_and_policy_defaults_are_compatible() {
         let legacy_json = r#"{
             "plan": {
                 "commands": [{"dir": ".", "cmd": "demo build"}],
@@ -515,9 +644,10 @@ mod tests {
         let legacy_value: serde_json::Value = serde_json::from_str(legacy_json).unwrap();
 
         let response: PlanResponse = serde_json::from_str(legacy_json).unwrap();
+        let policy_response: PlanResponseWithPolicy = serde_json::from_str(legacy_json).unwrap();
 
         assert_eq!(
-            response.execution_policy,
+            policy_response.execution_policy,
             PlanExecutionPolicy::legacy_defaults()
         );
         assert_eq!(response.plan.commands[0].cmd, "demo build");
@@ -528,7 +658,7 @@ mod tests {
 
     #[test]
     fn explicit_plan_execution_policy_round_trips() {
-        let response = PlanResponse {
+        let response = PlanResponseWithPolicy {
             plan: ExecutionPlan {
                 pre_commands: vec![],
                 commands: vec![PlannedCommand {
@@ -548,7 +678,7 @@ mod tests {
         };
 
         let json = serde_json::to_string(&response).unwrap();
-        let decoded: PlanResponse = serde_json::from_str(&json).unwrap();
+        let decoded: PlanResponseWithPolicy = serde_json::from_str(&json).unwrap();
 
         assert_eq!(decoded.execution_policy, response.execution_policy);
         assert!(json.contains("execution_policy"));
@@ -556,7 +686,7 @@ mod tests {
 
     #[test]
     fn partial_execution_policy_uses_legacy_field_defaults() {
-        let response: PlanResponse = serde_json::from_str(
+        let response: PlanResponseWithPolicy = serde_json::from_str(
             r#"{
                 "plan": {"commands": []},
                 "execution_policy": {"expand_loop_aliases": false}
