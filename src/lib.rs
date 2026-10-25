@@ -87,6 +87,9 @@ pub struct PluginRequestOptions {
     pub recursive: bool,
     #[serde(default)]
     pub depth: Option<usize>,
+    /// `--include` as the user typed it. The host has already applied it
+    /// (and `exclude_filters`) to `PluginRequest::projects`; a plugin that acts
+    /// on repos it finds itself must refuse filters it cannot honor.
     #[serde(default)]
     pub include_filters: Option<Vec<String>>,
     #[serde(default)]
