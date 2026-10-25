@@ -57,6 +57,8 @@ pub struct PluginHelp {
 /// A request from the meta CLI host to a plugin, sent as JSON on stdin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginRequest {
+    /// The plugin command the user named, e.g. `git status`: the claimed
+    /// words only. Everything the user typed after them is in `args`.
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -85,6 +87,9 @@ pub struct PluginRequestOptions {
     pub recursive: bool,
     #[serde(default)]
     pub depth: Option<usize>,
+    /// `--include` as the user typed it. The host has already applied it
+    /// (and `exclude_filters`) to `PluginRequest::projects`; a plugin that acts
+    /// on repos it finds itself must refuse filters it cannot honor.
     #[serde(default)]
     pub include_filters: Option<Vec<String>>,
     #[serde(default)]
@@ -137,8 +142,9 @@ pub struct ExecutionPlan {
 pub struct PlannedCommand {
     /// Directory to execute in (relative to meta root or absolute)
     pub dir: String,
-    /// Command to execute
-    pub cmd: String,
+    /// The program and its arguments. The host runs them as given, with no
+    /// shell in between, so no quoting is needed.
+    pub argv: Vec<String>,
     /// Environment variables to set for this command's subprocess
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
